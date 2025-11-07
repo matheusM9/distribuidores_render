@@ -37,11 +37,11 @@ WORKSHEET = None
 
 def init_gsheets():
     global GC, WORKSHEET
-    if "google_service_account" not in st.secrets:
+    if "gcp_service_account" not in st.secrets:
         st.error("❌ Google Service Account não configurada nos Secrets do Streamlit Cloud.")
         st.stop()
     try:
-        creds_dict = st.secrets["google_service_account"]
+        creds_dict = st.secrets["gcp_service_account"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
         GC = gspread.authorize(creds)
         sh = GC.open_by_key(SHEET_ID)
@@ -304,6 +304,7 @@ def validar_telefone(tel):
 def validar_email(email):
     padrao = r'^[\w\.-]+@[\w\.-]+\.\w+$'
     return re.match(padrao, email)
+
 # =============================
 # CADASTRO
 # =============================
