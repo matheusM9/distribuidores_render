@@ -223,10 +223,14 @@ def criar_mapa(df, filtro_distribuidores=None):
             try:
                 lat = float(row["Latitude"]) if row["Latitude"] not in (None, "") else -14.2350
                 lon = float(row["Longitude"]) if row["Longitude"] not in (None, "") else -51.9253
-                folium.Marker(
-                    location=[lat, lon],
-                    icon=folium.Icon(color="blue", icon="building", prefix="fa"),
-                    popup=f"{row['Distribuidor']} ({cidade} - {estado})"
+                folium.CircleMarker(
+                   location=[lat, lon],
+                   radius=12,
+                   color="#333333",
+                   fill=True,
+                   fill_color=cor,
+                   fill_opacity=0.6,
+                   popup=f"{row['Distribuidor']} ({cidade} - {estado})"
                 ).add_to(mapa)
             except:
                 continue
