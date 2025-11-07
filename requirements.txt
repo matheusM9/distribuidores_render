@@ -1,0 +1,8 @@
+streamlit
+streamlit-folium
+geopy
+bcrypt
+pandas
+requests
+streamlit-cookies-manager
+folium
