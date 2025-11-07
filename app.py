@@ -25,12 +25,11 @@ from google.auth.exceptions import DefaultCredentialsError, RefreshError
 # CONFIGURAÇÃO GOOGLE SHEETS
 # -----------------------------
 SHEET_ID = "1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k"
-SHEET_NAME = "Página1"  # aba informada pelo usuário
-
+SHEET_NAME = "Página1"
 COLUNAS = ["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Latitude", "Longitude"]
 
 # -----------------------------
-# Inicializar Google Sheets client (trata erros de credenciais)
+# Inicializar Google Sheets client
 # -----------------------------
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 GC = None
@@ -38,24 +37,21 @@ WORKSHEET = None
 
 def init_gsheets():
     global GC, WORKSHEET
-    # checa se credentials.json existe
-    if not os.path.exists("credentials.json"):
-        st.error("Arquivo 'credentials.json' não encontrado. Coloque-o na mesma pasta do app e reinicie.")
+    if "google_service_account" not in st.secrets:
+        st.error("❌ Google Service Account não configurada nos Secrets do Streamlit Cloud.")
         st.stop()
-
     try:
-        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPE)
+        creds_dict = st.secrets["google_service_account"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
         GC = gspread.authorize(creds)
         sh = GC.open_by_key(SHEET_ID)
         try:
             WORKSHEET = sh.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
-            # tenta criar a aba se não existir
             WORKSHEET = sh.add_worksheet(title=SHEET_NAME, rows="1000", cols=str(len(COLUNAS)))
-            # inicializa cabeçalho vazio
             WORKSHEET.update([COLUNAS])
     except (DefaultCredentialsError, RefreshError, Exception) as e:
-        st.error("Erro ao autenticar Google Sheets. Verifique 'credentials.json' e as permissões da service account.")
+        st.error("Erro ao autenticar Google Sheets. Verifique o Secret da Service Account.\n" + str(e))
         st.stop()
 
 init_gsheets()
@@ -64,10 +60,6 @@ init_gsheets()
 # FUNÇÕES DE DADOS (Sheets)
 # -----------------------------
 def carregar_dados():
-    """
-    Carrega toda a planilha para um DataFrame com as COLUNAS definidas.
-    Se a planilha estiver vazia, cria o cabeçalho e retorna DF vazio.
-    """
     try:
         records = WORKSHEET.get_all_records()
     except Exception as e:
@@ -76,7 +68,6 @@ def carregar_dados():
 
     if not records:
         df = pd.DataFrame(columns=COLUNAS)
-        # garante que a planilha tenha o cabeçalho
         try:
             WORKSHEET.clear()
             WORKSHEET.update([COLUNAS])
@@ -92,15 +83,9 @@ def carregar_dados():
     return df
 
 def salvar_dados(df):
-    """
-    Sobrescreve toda a aba com o conteúdo do DataFrame (incluindo cabeçalho).
-    Usamos clear() + update() para manter consistência.
-    """
     try:
         df2 = df.copy()
-        # garantir as colunas exatas
         df2 = df2[COLUNAS]
-        # substitui NaN por string vazia para evitar problemas no Sheets
         df2 = df2.fillna("")
         WORKSHEET.clear()
         WORKSHEET.update([df2.columns.values.tolist()] + df2.values.tolist())
@@ -112,7 +97,7 @@ def salvar_dados(df):
 # -----------------------------
 cookies = EncryptedCookieManager(
     prefix="distribuidores_login",
-    password="chave_secreta_segura_123"  # em produção, troque essa senha por uma mais forte e mantenha segura
+    password="chave_secreta_segura_123"
 )
 if not cookies.ready():
     st.stop()
@@ -276,7 +261,6 @@ def init_usuarios():
 usuarios = init_usuarios()
 usuario_cookie = cookies.get("usuario", "")
 nivel_cookie = cookies.get("nivel", "")
-
 logado = usuario_cookie != "" and nivel_cookie != ""
 usuario_atual = usuario_cookie if logado else None
 nivel_acesso = nivel_cookie if logado else None
@@ -303,7 +287,7 @@ if st.sidebar.button("🚪 Sair"):
     st.rerun()
 
 # -----------------------------
-# CARREGAR DADOS (inicializa sessão)
+# CARREGAR DADOS (sessão)
 # -----------------------------
 if "df" not in st.session_state:
     st.session_state.df = carregar_dados()
@@ -320,7 +304,6 @@ def validar_telefone(tel):
 def validar_email(email):
     padrao = r'^[\w\.-]+@[\w\.-]+\.\w+$'
     return re.match(padrao, email)
-
 # =============================
 # CADASTRO
 # =============================
