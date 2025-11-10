@@ -1,5 +1,9 @@
 # -------------------------------------------------------------
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
+# Corrigido: filtros na sidebar, limpar filtros sem erro,
+# multiselect de distribuidores com opções corretas,
+# zoom por estado robusto (evita "Antártida").
+# Base de dados: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
 # -------------------------------------------------------------
 import streamlit as st
 st.set_page_config(page_title="Distribuidores", layout="wide")
@@ -84,7 +88,6 @@ def carregar_dados():
     df = df[COLUNAS]
     return df
 
-
 def salvar_dados(df):
     """Grava os dados no Google Sheets (sem cache)"""
     try:
@@ -119,6 +122,40 @@ CAPITAIS_BRASILEIRAS = [
 
 def cidade_eh_capital(cidade, uf):
     return f"{cidade}-{uf}" in CAPITAIS_BRASILEIRAS
+
+# -----------------------------
+# CENTROIDES FIXOS POR UF (fallback rápido e seguro)
+# -----------------------------
+# Estas são coordenadas aproximadas do centro de cada estado brasileiro (lat, lon) e um zoom sugerido.
+STATE_CENTROIDS = {
+    "AC": {"center": [-8.77, -70.55], "zoom": 6},
+    "AL": {"center": [-9.62, -36.82], "zoom": 7},
+    "AP": {"center": [1.41, -51.77], "zoom": 6},
+    "AM": {"center": [-3.07, -61.67], "zoom": 5},
+    "BA": {"center": [-13.29, -41.71], "zoom": 6},
+    "CE": {"center": [-5.20, -39.53], "zoom": 7},
+    "DF": {"center": [-15.79, -47.88], "zoom": 10},
+    "ES": {"center": [-19.19, -40.34], "zoom": 8},
+    "GO": {"center": [-16.64, -49.31], "zoom": 7},
+    "MA": {"center": [-2.55, -44.30], "zoom": 6},
+    "MT": {"center": [-12.64, -55.42], "zoom": 5},
+    "MS": {"center": [-20.51, -54.54], "zoom": 6},
+    "MG": {"center": [-18.10, -44.38], "zoom": 6},
+    "PA": {"center": [-5.53, -52.29], "zoom": 5},
+    "PB": {"center": [-7.06, -35.55], "zoom": 7},
+    "PR": {"center": [-24.89, -51.55], "zoom": 7},
+    "PE": {"center": [-8.28, -35.07], "zoom": 7},
+    "PI": {"center": [-7.71, -42.73], "zoom": 6},
+    "RJ": {"center": [-22.90, -43.20], "zoom": 8},
+    "RN": {"center": [-5.22, -36.52], "zoom": 7},
+    "RS": {"center": [-30.03, -51.23], "zoom": 6},
+    "RO": {"center": [-10.83, -63.34], "zoom": 6},
+    "RR": {"center": [2.82, -60.67], "zoom": 6},
+    "SC": {"center": [-27.33, -49.44], "zoom": 7},
+    "SP": {"center": [-22.19, -48.79], "zoom": 7},
+    "SE": {"center": [-10.90, -37.07], "zoom": 7},
+    "TO": {"center": [-9.45, -48.26], "zoom": 6}
+}
 
 # -----------------------------
 # FUNÇÕES AUXILIARES (IBGE + GEO)
@@ -198,11 +235,10 @@ def cor_distribuidor(nome):
     h += 0x111111
     return f"#{h:06X}"
 
-# utility: recursivamente extrai coordenadas (lon, lat) de um GeoJSON (suporta MultiPolygon/Polygon)
+# utility: extrai coords de geojson (lon, lat) recursivamente
 def _extract_coords_from_geojson_coords(coords, out):
     if isinstance(coords[0], (float, int)):
-        # é um ponto [lon, lat]
-        out.append((coords[1], coords[0]))  # retornamos (lat, lon)
+        out.append((coords[1], coords[0]))  # (lat, lon)
     else:
         for c in coords:
             _extract_coords_from_geojson_coords(c, out)
@@ -224,15 +260,8 @@ def _centroid_and_bbox_from_feature(feature):
 def _state_feature_by_sigla(geojson_estados, sigla):
     for feat in geojson_estados.get("features", []):
         props = feat.get("properties", {})
-        # Tentar combinar pela sigla, depois pelo nome
         if props.get("sigla") == sigla or props.get("UF") == sigla or props.get("ESTADO") == sigla:
             return feat
-        # alguns datasets usam 'nome'
-        nome = props.get("nome") or props.get("NOME")
-        if nome and nome.endswith(f" - {sigla}") is False:
-            # não faz nada; mantemos tentativa por sigla
-            pass
-    # fallback: procurar por sigla no nome (caso proprietários tenham nomes unificados)
     for feat in geojson_estados.get("features", []):
         props = feat.get("properties", {})
         nome = props.get("nome") or props.get("NOME") or ""
@@ -285,7 +314,7 @@ def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
                 lat = float(lat_raw) if lat_raw not in (None, "", " ") else None
                 lon = float(lon_raw) if lon_raw not in (None, "", " ") else None
                 if lat is None or lon is None:
-                    # se não tem coords válidas, pulamos (não colocamos no centro do brasil por padrão)
+                    # sem coords válidas -> não inserir marcador (evita centros errados)
                     continue
                 folium.CircleMarker(
                    location=[lat, lon],
@@ -485,7 +514,7 @@ elif choice == "Lista / Editar / Excluir":
                     st.success(f"🗑️ '{dist_del}' removido!")
 
 # =============================
-# MAPA (filtros na sidebar, sem lista na área principal)
+# MAPA (filtros na sidebar, sem tabela na área principal)
 # =============================
 elif choice == "Mapa":
     st.subheader("🗺️ Mapa de Distribuidores")
@@ -509,12 +538,17 @@ elif choice == "Mapa":
     estado_filtro = st.sidebar.selectbox("Filtrar por Estado", [""] + siglas, index=(0 if st.session_state.estado_filtro == "" else ([""] + siglas).index(st.session_state.estado_filtro)))
     st.session_state.estado_filtro = estado_filtro
 
-    # Filtrar distribuidores (multiselect) - opções restritas ao estado se houver
-    distribuidores_opcoes = st.session_state.df["Distribuidor"].unique().tolist()
+    # Filtrar distribuidores (multiselect) - opções restritas ao estado se houver,
+    # senão mostrar todos os distribuidores
     if estado_filtro:
-        distribuidores_opcoes = st.session_state.df[st.session_state.df["Estado"] == estado_filtro]["Distribuidor"].unique().tolist()
-    distribuidores_selecionados = st.sidebar.multiselect("Filtrar Distribuidores (opcional)", sorted(distribuidores_opcoes), default=st.session_state.distribuidores_selecionados)
-    st.session_state.distribuidores_selecionados = distribuidores_selecionados
+        distribuidores_opcoes = st.session_state.df.loc[st.session_state.df["Estado"] == estado_filtro, "Distribuidor"].dropna().unique().tolist()
+    else:
+        distribuidores_opcoes = st.session_state.df["Distribuidor"].dropna().unique().tolist()
+
+    distribuidores_opcoes = sorted(distribuidores_opcoes)
+    distribuidores_selecionados = st.sidebar.multiselect("Filtrar Distribuidores (opcional)", distribuidores_opcoes, default=st.session_state.distribuidores_selecionados)
+    # garante que session_state mantenha apenas valores válidos
+    st.session_state.distribuidores_selecionados = [d for d in distribuidores_selecionados if d in distribuidores_opcoes]
 
     # Busca por cidade (lista filtrada por estado se houver)
     todas_cidades = carregar_todas_cidades()
@@ -525,13 +559,12 @@ elif choice == "Mapa":
     if cidade_selecionada_sidebar:
         st.session_state.cidade_busca = cidade_selecionada_sidebar
 
-    # Botão limpar filtros: limpa tudo e rerun
+    # Botão limpar filtros: reseta variáveis de session_state (sem usar experimental_rerun)
     if st.sidebar.button("Limpar filtros"):
         st.session_state.estado_filtro = ""
         st.session_state.distribuidores_selecionados = []
         st.session_state.cidade_busca = ""
-        # forçar recarregamento
-        st.experimental_rerun()
+        # não usamos st.experimental_rerun() — o Streamlit já reflete o novo session_state na UI sem necessidade de rerun aqui.
 
     # ---------------------
     # Aplicar filtros combinados ao dataframe
@@ -555,28 +588,23 @@ elif choice == "Mapa":
             # formato inesperado: ignorar filtro de cidade
             pass
 
-    # OBS: conforme solicitado, NÃO mostramos a tabela de distribuidores nesta aba, apenas o mapa.
-
     # ---------------------
     # Determinar zoom/centro de forma robusta (evitar Antártida)
     # - 1) usar as coords dos distribuidores filtrados (se houver)
-    # - 2) senão, tentar o centróide do GeoJSON do estado (IBGE)
-    # - 3) senão, usar centro padrão do Brasil
+    # - 2) senão, usar centroid fixo em STATE_CENTROIDS (por sigla)
+    # - 3) fallback: centro do Brasil
     # ---------------------
     zoom_to_state = None
     if st.session_state.estado_filtro:
-        # 1) tentar usar coords dos distribuidores do próprio estado (não apenas df_filtro)
         df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
         lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
         lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
         if not lats.empty and not lons.empty:
             center_lat = float(lats.mean())
             center_lon = float(lons.mean())
-            # calcular amplitude para ajustar zoom
             lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
             lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
             span = max(lat_span, lon_span)
-            # heurística simples para zoom
             if span < 0.2:
                 zoom = 11
             elif span < 1.0:
@@ -587,33 +615,18 @@ elif choice == "Mapa":
                 zoom = 6
             zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
         else:
-            # 2) tentar centroid a partir do geojson dos estados (IBGE)
-            geo_estados = obter_geojson_estados()
-            if geo_estados:
-                feat = _state_feature_by_sigla(geo_estados, st.session_state.estado_filtro)
-                if feat:
-                    centroid_bbox = _centroid_and_bbox_from_feature(feat)
-                    if centroid_bbox:
-                        centroid, bbox = centroid_bbox
-                        # bbox = [min_lat, min_lon, max_lat, max_lon]
-                        lat_span = bbox[2] - bbox[0]
-                        lon_span = bbox[3] - bbox[1]
-                        span = max(lat_span, lon_span)
-                        if span < 0.2:
-                            zoom = 11
-                        elif span < 1.0:
-                            zoom = 9
-                        elif span < 3.0:
-                            zoom = 8
-                        else:
-                            zoom = 6
-                        zoom_to_state = {"center": centroid, "zoom": zoom}
-            # fallback robusto: centro do Brasil
-            if not zoom_to_state:
+            # fallback seguro: usar centroides pré-definidos por UF
+            if st.session_state.estado_filtro in STATE_CENTROIDS:
+                zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
+            else:
                 zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
 
     # ---------------------
     # Criar e exibir o mapa com filtros aplicados
     # ---------------------
-    mapa = criar_mapa(df_filtro, filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None), zoom_to_state=zoom_to_state)
+    mapa = criar_mapa(
+        df_filtro,
+        filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None),
+        zoom_to_state=zoom_to_state
+    )
     st_folium(mapa, width=1200, height=700)
