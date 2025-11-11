@@ -3,8 +3,6 @@
 # Versão final: filtros sidebar, busca cidade com mensagem/tabela,
 # limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
 # Base: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
-# Alterações: permite mesmo nome em estados diferentes; edição por estado;
-# exclusão por estado ou total.
 # -------------------------------------------------------------
 import streamlit as st
 st.set_page_config(page_title="Distribuidores", layout="wide")
@@ -458,43 +456,36 @@ if choice == "Cadastro" and nivel_cookie == "editor":
             st.error("Contato inválido! Use o formato (XX) XXXXX-XXXX")
         elif not validar_email(email.strip()):
             st.error("Email inválido!")
+        elif nome in st.session_state.df["Distribuidor"].tolist():
+            st.error("Distribuidor já cadastrado!")
         else:
-            # NOVA LÓGICA: permitir mesmo nome em estados diferentes,
-            # mas **não** permitir duplicata no mesmo estado.
-            existe_mesmo_estado = ((st.session_state.df["Distribuidor"].str.lower() == nome.strip().lower()) &
-                                   (st.session_state.df["Estado"] == estado_sel)).any()
-            if existe_mesmo_estado:
-                st.error("Distribuidor já cadastrado neste estado!")
+            cidades_ocupadas = []
+            for c in cidades_sel:
+                if c in st.session_state.df["Cidade"].tolist() and not cidade_eh_capital(c, estado_sel):
+                    dist_existente = st.session_state.df.loc[st.session_state.df["Cidade"] == c, "Distribuidor"].iloc[0]
+                    cidades_ocupadas.append(f"{c} (atualmente atribuída a {dist_existente})")
+            if cidades_ocupadas:
+                st.error("As seguintes cidades já estão atribuídas a outros distribuidores:\n" + "\n".join(cidades_ocupadas))
             else:
-                cidades_ocupadas = []
+                novos = []
                 for c in cidades_sel:
-                    # se cidade já está atribuída a outro distribuidor (em mesma UF) e não for capital, bloquear
-                    cond = (st.session_state.df["Cidade"] == c) & (st.session_state.df["Estado"] == estado_sel)
-                    if cond.any() and not cidade_eh_capital(c, estado_sel):
-                        dist_existente = st.session_state.df.loc[cond, "Distribuidor"].iloc[0]
-                        cidades_ocupadas.append(f"{c} (atualmente atribuída a {dist_existente})")
-                if cidades_ocupadas:
-                    st.error("As seguintes cidades já estão atribuídas a outros distribuidores:\n" + "\n".join(cidades_ocupadas))
-                else:
-                    novos = []
-                    for c in cidades_sel:
-                        lat, lon = obter_coordenadas(c, estado_sel)
-                        try:
-                            if lat is None or lon is None or lat == "" or lon == "":
-                                lat_v, lon_v = pd.NA, pd.NA
-                            else:
-                                lat_v = float(str(lat).replace(",", "."))
-                                lon_v = float(str(lon).replace(",", "."))
-                                if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
-                                    lat_v, lon_v = pd.NA, pd.NA
-                        except:
+                    lat, lon = obter_coordenadas(c, estado_sel)
+                    try:
+                        if lat is None or lon is None or lat == "" or lon == "":
                             lat_v, lon_v = pd.NA, pd.NA
-                        novos.append([nome, contato, email, estado_sel, c, lat_v, lon_v])
-                    novo_df = pd.DataFrame(novos, columns=COLUNAS)
-                    st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
-                    salvar_dados(st.session_state.df)
-                    st.session_state.df = carregar_dados()
-                    st.success(f"✅ Distribuidor '{nome}' adicionado no estado {estado_sel}!")
+                        else:
+                            lat_v = float(str(lat).replace(",", "."))
+                            lon_v = float(str(lon).replace(",", "."))
+                            if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
+                                lat_v, lon_v = pd.NA, pd.NA
+                    except:
+                        lat_v, lon_v = pd.NA, pd.NA
+                    novos.append([nome, contato, email, estado_sel, c, lat_v, lon_v])
+                novo_df = pd.DataFrame(novos, columns=COLUNAS)
+                st.session_state.df = pd.concat([st.session_state.df, novo_df], ignore_index=True)
+                salvar_dados(st.session_state.df)
+                st.session_state.df = carregar_dados()
+                st.success(f"✅ Distribuidor '{nome}' adicionado!")
 
 # =============================
 # LISTA / EDITAR / EXCLUIR
@@ -506,30 +497,16 @@ elif choice == "Lista / Editar / Excluir":
     if nivel_cookie == "editor":
         with st.expander("✏️ Editar"):
             if not st.session_state.df.empty:
-                # Selecionar nome do distribuidor (único por nome, mesmo que exista em vários estados)
-                dist_edit = st.selectbox("Distribuidor", sorted(st.session_state.df["Distribuidor"].unique()))
-                # obter estados onde esse distribuidor atua
-                estados_do_dist = sorted(st.session_state.df.loc[st.session_state.df["Distribuidor"] == dist_edit, "Estado"].unique())
-                # permitir escolher qual estado editar
-                estado_para_editar = st.selectbox("Estado do distribuidor (escolha qual registro editar)", estados_do_dist)
-                # dados apenas daquele nome+estado
-                dados = st.session_state.df[
-                    (st.session_state.df["Distribuidor"] == dist_edit) &
-                    (st.session_state.df["Estado"] == estado_para_editar)
-                ]
-                # Carregar campos (usar o primeiro registro como base)
+                dist_edit = st.selectbox("Distribuidor", st.session_state.df["Distribuidor"].unique())
+                dados = st.session_state.df[st.session_state.df["Distribuidor"] == dist_edit]
                 nome_edit = st.text_input("Nome", value=dist_edit)
-                contato_edit = st.text_input("Contato", value=dados.iloc[0]["Contato"] if not dados.empty else "")
-                email_edit = st.text_input("Email", value=dados.iloc[0]["Email"] if not dados.empty else "")
-                # permitir ao editor mudar o estado (ex: transferir cidades para outro estado) - opcional
-                todos_estados = [e["sigla"] for e in carregar_estados()]
-                # preselect index do estado_para_editar em todos_estados
-                try:
-                    index_estado = todos_estados.index(estado_para_editar)
-                except ValueError:
-                    index_estado = 0
-                estado_edit = st.selectbox("Estado (modifique se necessário)", todos_estados, index=index_estado)
-
+                contato_edit = st.text_input("Contato", value=dados.iloc[0]["Contato"])
+                email_edit = st.text_input("Email", value=dados.iloc[0]["Email"])
+                estado_edit = st.selectbox(
+                    "Estado",
+                    sorted(st.session_state.df["Estado"].unique()),
+                    index=sorted(st.session_state.df["Estado"].unique()).index(dados.iloc[0]["Estado"])
+                )
                 cidades_disponiveis = [c["nome"] for c in carregar_cidades(estado_edit)]
                 cidades_novas = st.multiselect("Cidades", cidades_disponiveis, default=dados["Cidade"].tolist())
 
@@ -539,26 +516,16 @@ elif choice == "Lista / Editar / Excluir":
                     elif not validar_email(email_edit.strip()):
                         st.error("Email inválido!")
                     else:
-                        # verificar conflitos de cidades (se mover para outro estado, checar nesse estado)
-                        # remover apenas as linhas correspondentes ao distribuidor+estado_para_editar (antes de recriar)
-                        outras_linhas = st.session_state.df[
-                            ~((st.session_state.df["Distribuidor"] == dist_edit) &
-                              (st.session_state.df["Estado"] == estado_para_editar))
-                        ]
-
+                        outras_linhas = st.session_state.df[st.session_state.df["Distribuidor"] != dist_edit]
                         cidades_ocupadas = []
                         for cidade in cidades_novas:
                             if cidade in outras_linhas["Cidade"].tolist() and not cidade_eh_capital(cidade, estado_edit):
-                                # encontrar o distribuidor que já tem essa cidade no estado target
-                                cond = (outras_linhas["Cidade"] == cidade) & (outras_linhas["Estado"] == estado_edit)
-                                if cond.any():
-                                    dist_existente = outras_linhas.loc[cond, "Distribuidor"].iloc[0]
-                                    cidades_ocupadas.append(f"{cidade} (atualmente atribuída a {dist_existente})")
+                                dist_existente = outras_linhas.loc[outras_linhas["Cidade"] == cidade, "Distribuidor"].iloc[0]
+                                cidades_ocupadas.append(f"{cidade} (atualmente atribuída a {dist_existente})")
                         if cidades_ocupadas:
                             st.error("As seguintes cidades já estão atribuídas a outros distribuidores:\n" + "\n".join(cidades_ocupadas))
                         else:
-                            # remove apenas o bloco nome+estado_para_editar
-                            st.session_state.df = st.session_state.df[~((st.session_state.df["Distribuidor"] == dist_edit) & (st.session_state.df["Estado"] == estado_para_editar))]
+                            st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_edit]
                             novos = []
                             for cidade in cidades_novas:
                                 lat, lon = obter_coordenadas(cidade, estado_edit)
@@ -581,23 +548,12 @@ elif choice == "Lista / Editar / Excluir":
 
         with st.expander("🗑️ Excluir"):
             if not st.session_state.df.empty:
-                # Se distribuidor atua em múltiplos estados, permitir escolher o escopo da exclusão.
-                dist_del = st.selectbox("Distribuidor para excluir", sorted(st.session_state.df["Distribuidor"].unique()))
-                estados_do_dist_del = sorted(st.session_state.df.loc[st.session_state.df["Distribuidor"] == dist_del, "Estado"].unique())
-                opcao_exclusao = st.selectbox("Excluir registro de:", ["Apenas um estado", "Todos os estados"])
-                if opcao_exclusao == "Apenas um estado":
-                    estado_para_excluir = st.selectbox("Escolha o estado a excluir", estados_do_dist_del)
-                    if st.button("Excluir Distribuidor (apenas esse estado)"):
-                        st.session_state.df = st.session_state.df[~((st.session_state.df["Distribuidor"] == dist_del) & (st.session_state.df["Estado"] == estado_para_excluir))]
-                        salvar_dados(st.session_state.df)
-                        st.session_state.df = carregar_dados()
-                        st.success(f"🗑️ '{dist_del}' removido do estado {estado_para_excluir}!")
-                else:
-                    if st.button("Excluir Distribuidor (todos os estados)"):
-                        st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_del]
-                        salvar_dados(st.session_state.df)
-                        st.session_state.df = carregar_dados()
-                        st.success(f"🗑️ '{dist_del}' removido de todos os estados!")
+                dist_del = st.selectbox("Distribuidor para excluir", st.session_state.df["Distribuidor"].unique())
+                if st.button("Excluir Distribuidor"):
+                    st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_del]
+                    salvar_dados(st.session_state.df)
+                    st.session_state.df = carregar_dados()
+                    st.success(f"🗑️ '{dist_del}' removido!")
 
 # =============================
 # MAPA (filtros na sidebar, com busca de cidade mostrando mensagens/tabela)
