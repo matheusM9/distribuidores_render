@@ -1,22 +1,24 @@
 # -------------------------------------------------------------
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
-# Versão final: filtros sidebar, busca cidade com mensagem/tabela,
-# limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
-# Base: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
+# Versão pydeck: desempenho melhor com muitos pontos mantendo
+# todas as funcionalidades (filtros, busca, salvar coords, edição).
+# Planilha: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
 # -------------------------------------------------------------
 
 import os
 import json
 import re
+import math
+import time
+import hashlib
 import requests
 import pandas as pd
-import folium
+import pydeck as pdk
 import bcrypt
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+from io import StringIO
+from typing import Tuple, Optional, List, Dict
 
 import streamlit as st
-from streamlit_folium import st_folium
 from streamlit_cookies_manager import EncryptedCookieManager
 
 # Google Sheets
@@ -24,6 +26,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
 
+# Geocoding
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+
+# Streamlit config
 st.set_page_config(page_title="Distribuidores", layout="wide")
 
 # -----------------------------
@@ -34,20 +41,40 @@ SHEET_NAME = "Página1"
 COLUNAS = ["Distribuidor", "Contato", "Email", "Estado", "Cidade", "Latitude", "Longitude"]
 
 # -----------------------------
-# Inicializar Google Sheets client
+# PATHS LOCAIS / ARQUIVOS
+# -----------------------------
+USUARIOS_FILE = "usuarios.json"
+
+# -----------------------------
+# SCOPES GOOGLE
 # -----------------------------
 SCOPE = [
-    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+# Globals for gspread objects
 GC = None
 WORKSHEET = None
 
+# -----------------------------
+# UTIL: limpar/formatar strings
+# -----------------------------
+def _safe_str(x) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
 
+
+# -----------------------------
+# INICIALIZAÇÃO DO GOOGLE SHEETS
+# - autentica via Service Account JSON guardado em st.secrets["gcp_service_account"]
+# - cria aba e colunas se necessário (Latitude/Longitude criadas automaticamente)
+# -----------------------------
 def init_gsheets():
     global GC, WORKSHEET
     if "gcp_service_account" not in st.secrets:
-        st.error("❌ Google Service Account não configurada nos Secrets do Streamlit Cloud.")
+        st.error("❌ Google Service Account não encontrada nos Secrets do Streamlit Cloud.")
         st.stop()
     try:
         creds_dict = st.secrets["gcp_service_account"]
@@ -57,21 +84,41 @@ def init_gsheets():
         try:
             WORKSHEET = sh.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
-            WORKSHEET = sh.add_worksheet(title=SHEET_NAME, rows="1000", cols=str(len(COLUNAS)))
+            # criar e inicializar colunas
+            WORKSHEET = sh.add_worksheet(title=SHEET_NAME, rows="2000", cols="20")
             WORKSHEET.update([COLUNAS])
-    except (DefaultCredentialsError, RefreshError, Exception) as e:
-        st.error("Erro ao autenticar Google Sheets. Verifique o Secret da Service Account.\n" + str(e))
+        # garantir que as colunas existam e estejam na ordem desejada
+        header = WORKSHEET.row_values(1)
+        if not header:
+            WORKSHEET.update([COLUNAS])
+        else:
+            # criar colunas faltantes (Latitude/Longitude) se necessário
+            missing = [c for c in COLUNAS if c not in header]
+            if missing:
+                new_header = header + missing
+                WORKSHEET.update([new_header])
+    except Exception as e:
+        st.error("Erro ao autenticar/abrir Google Sheets: " + str(e))
         st.stop()
 
 
 init_gsheets()
 
 # -----------------------------
+# CACHE simples para geocoding (memória durante sessão)
+# -----------------------------
+if "geo_cache" not in st.session_state:
+    st.session_state.geo_cache = {}
+
+# -----------------------------
 # FUNÇÕES DE DADOS (Sheets)
 # -----------------------------
 @st.cache_data(ttl=300)
-def carregar_dados():
-    """Busca dados do Google Sheets, garante colunas e sanitiza lat/lon."""
+def carregar_dados() -> pd.DataFrame:
+    """
+    Carrega dados do Google Sheets, garante colunas básicas, sanitiza lat/lon.
+    Se não houver linhas, retorna df com colunas.
+    """
     try:
         records = WORKSHEET.get_all_records()
     except Exception as e:
@@ -79,19 +126,22 @@ def carregar_dados():
         return pd.DataFrame(columns=COLUNAS)
 
     if not records:
-        df = pd.DataFrame(columns=COLUNAS)
+        # inicializar cabeçalho na planilha se necessário
         try:
-            WORKSHEET.clear()
-            WORKSHEET.update([COLUNAS])
+            header = WORKSHEET.row_values(1)
+            if not header:
+                WORKSHEET.update([COLUNAS])
         except Exception:
             pass
-        return df
+        return pd.DataFrame(columns=COLUNAS)
 
     df = pd.DataFrame(records)
+    # adicionar colunas faltantes
     for col in COLUNAS:
         if col not in df.columns:
             df[col] = ""
 
+    # manter somente as colunas desejadas na ordem certa
     df = df[COLUNAS].copy()
 
     # Sanitizar Latitude/Longitude: converter para número, aceitar apenas faixa do Brasil
@@ -103,8 +153,7 @@ def carregar_dados():
         s = str(x).strip()
         if s == "":
             return pd.NA
-        s = s.replace(",", ".")
-        s = s.replace(" ", "")
+        s = s.replace(",", ".").replace(" ", "")
         try:
             return float(s)
         except:
@@ -113,21 +162,24 @@ def carregar_dados():
     df["Latitude"] = df["Latitude"].apply(to_float_safe)
     df["Longitude"] = df["Longitude"].apply(to_float_safe)
 
-    # Validar limites aproximados do Brasil (lat: -35..6, lon: -82..-30). Valores fora são considerados inválidos.
+    # Limites aproximados do Brasil: latitude -35..6 , longitude -82..-30
     df.loc[~df["Latitude"].between(-35.0, 6.0, inclusive="both"), "Latitude"] = pd.NA
     df.loc[~df["Longitude"].between(-82.0, -30.0, inclusive="both"), "Longitude"] = pd.NA
 
     return df
 
 
-def salvar_dados(df):
-    """Grava os dados no Google Sheets (sem cache)"""
+def salvar_dados(df: pd.DataFrame):
+    """
+    Grava os dados no Google Sheets. Atualiza header e linhas.
+    """
     try:
         df2 = df.copy()
         df2 = df2[COLUNAS].fillna("")
+        # clear e update pode ser pesado; porém garante consistência
         WORKSHEET.clear()
         WORKSHEET.update([df2.columns.values.tolist()] + df2.values.tolist())
-        # limpar cache do carregamento de dados
+        # limpar cache carregamento
         try:
             st.cache_data.clear()
         except Exception:
@@ -147,276 +199,246 @@ if not cookies.ready():
     st.stop()
 
 # -----------------------------
-# CAPITAIS BRASILEIRAS
+# CAPITAIS BRASILEIRAS (para regras de alocação)
 # -----------------------------
 CAPITAIS_BRASILEIRAS = [
-    "Rio Branco-AC", "Maceió-AL", "Macapá-AP", "Manaus-AM", "Salvador-BA", "Fortaleza-CE",
-    "Brasília-DF", "Vitória-ES", "Goiânia-GO", "São Luís-MA", "Cuiabá-MT", "Campo Grande-MS",
-    "Belo Horizonte-MG", "Belém-PA", "João Pessoa-PB", "Curitiba-PR", "Recife-PE", "Teresina-PI",
-    "Rio de Janeiro-RJ", "Natal-RN", "Porto Alegre-RS", "Boa Vista-RR", "Florianópolis-SC",
-    "São Paulo-SP", "Aracaju-SE", "Palmas-TO"
+    "Rio Branco-AC","Maceió-AL","Macapá-AP","Manaus-AM","Salvador-BA","Fortaleza-CE",
+    "Brasília-DF","Vitória-ES","Goiânia-GO","São Luís-MA","Cuiabá-MT","Campo Grande-MS",
+    "Belo Horizonte-MG","Belém-PA","João Pessoa-PB","Curitiba-PR","Recife-PE","Teresina-PI",
+    "Rio de Janeiro-RJ","Natal-RN","Porto Alegre-RS","Boa Vista-RR","Florianópolis-SC",
+    "São Paulo-SP","Aracaju-SE","Palmas-TO"
 ]
 
 
-def cidade_eh_capital(cidade, uf):
+def cidade_eh_capital(cidade: str, uf: str) -> bool:
     return f"{cidade}-{uf}" in CAPITAIS_BRASILEIRAS
 
 
 # -----------------------------
-# CENTROIDES FIXOS POR UF (fallback seguro)
+# CENTROIDES FIXOS POR UF (fallback para zoom)
 # -----------------------------
 STATE_CENTROIDS = {
-    "AC": {"center": [-8.77, -70.55], "zoom": 6},
-    "AL": {"center": [-9.62, -36.82], "zoom": 7},
-    "AP": {"center": [1.41, -51.77], "zoom": 6},
-    "AM": {"center": [-3.07, -61.67], "zoom": 5},
-    "BA": {"center": [-13.29, -41.71], "zoom": 6},
-    "CE": {"center": [-5.20, -39.53], "zoom": 7},
-    "DF": {"center": [-15.79, -47.88], "zoom": 10},
-    "ES": {"center": [-19.19, -40.34], "zoom": 8},
-    "GO": {"center": [-16.64, -49.31], "zoom": 7},
-    "MA": {"center": [-2.55, -44.30], "zoom": 6},
-    "MT": {"center": [-12.64, -55.42], "zoom": 5},
-    "MS": {"center": [-20.51, -54.54], "zoom": 6},
-    "MG": {"center": [-18.10, -44.38], "zoom": 6},
-    "PA": {"center": [-5.53, -52.29], "zoom": 5},
-    "PB": {"center": [-7.06, -35.55], "zoom": 7},
-    "PR": {"center": [-24.89, -51.55], "zoom": 7},
-    "PE": {"center": [-8.28, -35.07], "zoom": 7},
-    "PI": {"center": [-7.71, -42.73], "zoom": 6},
-    "RJ": {"center": [-22.90, -43.20], "zoom": 8},
-    "RN": {"center": [-5.22, -36.52], "zoom": 7},
-    "RS": {"center": [-30.03, -51.23], "zoom": 6},
-    "RO": {"center": [-10.83, -63.34], "zoom": 6},
-    "RR": {"center": [2.82, -60.67], "zoom": 6},
-    "SC": {"center": [-27.33, -49.44], "zoom": 7},
-    "SP": {"center": [-22.19, -48.79], "zoom": 7},
-    "SE": {"center": [-10.90, -37.07], "zoom": 7},
-    "TO": {"center": [-9.45, -48.26], "zoom": 6},
+    "AC": {"center": [-8.77, -70.55], "zoom": 5.5},
+    "AL": {"center": [-9.62, -36.82], "zoom": 6.5},
+    "AP": {"center": [1.41, -51.77], "zoom": 5.5},
+    "AM": {"center": [-3.07, -61.67], "zoom": 4.5},
+    "BA": {"center": [-13.29, -41.71], "zoom": 5.5},
+    "CE": {"center": [-5.20, -39.53], "zoom": 6.5},
+    "DF": {"center": [-15.79, -47.88], "zoom": 9},
+    "ES": {"center": [-19.19, -40.34], "zoom": 6.5},
+    "GO": {"center": [-16.64, -49.31], "zoom": 6},
+    "MA": {"center": [-2.55, -44.30], "zoom": 5.5},
+    "MT": {"center": [-12.64, -55.42], "zoom": 4.5},
+    "MS": {"center": [-20.51, -54.54], "zoom": 5.5},
+    "MG": {"center": [-18.10, -44.38], "zoom": 5.5},
+    "PA": {"center": [-5.53, -52.29], "zoom": 4.5},
+    "PB": {"center": [-7.06, -35.55], "zoom": 6.5},
+    "PR": {"center": [-24.89, -51.55], "zoom": 6.5},
+    "PE": {"center": [-8.28, -35.07], "zoom": 6.5},
+    "PI": {"center": [-7.71, -42.73], "zoom": 5.5},
+    "RJ": {"center": [-22.90, -43.20], "zoom": 7},
+    "RN": {"center": [-5.22, -36.52], "zoom": 6.5},
+    "RS": {"center": [-30.03, -51.23], "zoom": 5.5},
+    "RO": {"center": [-10.83, -63.34], "zoom": 5.5},
+    "RR": {"center": [2.82, -60.67], "zoom": 5.5},
+    "SC": {"center": [-27.33, -49.44], "zoom": 6.5},
+    "SP": {"center": [-22.19, -48.79], "zoom": 6.5},
+    "SE": {"center": [-10.90, -37.07], "zoom": 6.5},
+    "TO": {"center": [-9.45, -48.26], "zoom": 5.5},
 }
 
 # -----------------------------
-# FUNÇÕES AUXILIARES (IBGE + GEO)
+# Carregar estados/cidades via IBGE (caching com st.cache_data)
 # -----------------------------
-@st.cache_data
-def carregar_estados():
+@st.cache_data(ttl=3600)
+def carregar_estados() -> List[Dict]:
     url = "https://servicodados.ibge.gov.br/api/v1/localidades/estados"
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
     return sorted(resp.json(), key=lambda e: e["nome"])
 
 
-@st.cache_data
-def carregar_cidades(uf):
+@st.cache_data(ttl=3600)
+def carregar_cidades(uf: str) -> List[Dict]:
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
     return sorted(resp.json(), key=lambda c: c["nome"])
 
 
-@st.cache_data
-def carregar_todas_cidades():
+@st.cache_data(ttl=3600)
+def carregar_todas_cidades() -> List[str]:
     cidades = []
     estados = carregar_estados()
     for estado in estados:
         uf = estado["sigla"]
         url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-        resp = requests.get(url)
+        resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             for c in resp.json():
                 cidades.append(f"{c['nome']} - {uf}")
     return sorted(cidades)
 
 
-def obter_coordenadas(cidade, estado):
-    geolocator = Nominatim(user_agent="distribuidores_app", timeout=5)
-    try:
-        location = geolocator.geocode(f"{cidade}, {estado}, Brasil")
-        if location:
-            return location.latitude, location.longitude
-        else:
-            return "", ""
-    except (GeocoderTimedOut, GeocoderUnavailable):
-        return "", ""
+# -----------------------------
+# GEOCODING (Nominatim)
+# - usa cache em st.session_state.geo_cache para evitar repetir
+# - grava coords na planilha quando encontrado (se for novo)
+# -----------------------------
+def geocode_with_cache(city: str, uf: str) -> Tuple[Optional[float], Optional[float]]:
+    key = f"{city.strip().lower()}___{uf.strip().upper()}"
+    cache = st.session_state.geo_cache
+    if key in cache:
+        return cache[key]
 
-
-@st.cache_data
-def obter_geojson_cidade(cidade, estado_sigla):
-    cidades_data = carregar_cidades(estado_sigla)
-    cidade_info = next((c for c in cidades_data if c["nome"] == cidade), None)
-    if not cidade_info:
-        return None
-    geojson_url = (
-        f"https://servicodados.ibge.gov.br/api/v2/malhas/{cidade_info['id']}"
-        "?formato=application/vnd.geo+json&qualidade=intermediaria"
-    )
+    # tentar Nominatim (padrão)
+    geolocator = Nominatim(user_agent="distribuidores_app_streamlit", timeout=8)
     try:
-        resp = requests.get(geojson_url, timeout=5)
-        if resp.status_code == 200:
-            return resp.json()
-    except:
+        loc = geolocator.geocode(f"{city}, {uf}, Brasil")
+        if loc:
+            lat, lon = float(loc.latitude), float(loc.longitude)
+            # sanity check Brasil range
+            if -35.0 <= lat <= 6.0 and -82.0 <= lon <= -30.0:
+                cache[key] = (lat, lon)
+                st.session_state.geo_cache = cache
+                return lat, lon
+    except (GeocoderTimedOut, GeocoderUnavailable, Exception):
+        # não propaga erro, retorna None
         pass
-    return None
+
+    cache[key] = (None, None)
+    st.session_state.geo_cache = cache
+    return None, None
 
 
-@st.cache_data
-def obter_geojson_estados():
-    url = (
-        "https://servicodados.ibge.gov.br/api/v2/malhas/"
-        "?formato=application/vnd.geo+json&qualidade=simplificada&incluir=estados"
-    )
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            geojson = resp.json()
-            for feature in geojson.get("features", []):
-                feature["properties"]["style"] = {
-                    "color": "#000000",
-                    "weight": 3,
-                    "dashArray": "0",
-                    "fillOpacity": 0,
-                }
-            return geojson
-    except:
-        pass
-    return None
+# -----------------------------
+# UTIL: cor por nome (gera hex)
+# -----------------------------
+def cor_distribuidor_hex(nome: str) -> str:
+    if not nome:
+        return "#777777"
+    # usar hash md5 para consistência entre execuções
+    h = hashlib.md5(nome.encode("utf-8")).hexdigest()
+    # pegar 6 chars hex
+    return f"#{h[:6]}".upper()
 
 
-def cor_distribuidor(nome):
-    h = abs(hash(nome)) % 0xAAAAAA
-    h += 0x111111
-    return f"#{h:06X}"
+# -----------------------------
+# Função que monta o dataframe para pydeck
+# Garante que cada linha tem lat/lon válidos; se não tiver, tenta geocodificar e grava.
+# -----------------------------
+def preparar_dataframe_para_mapa(df: pd.DataFrame, salvar_novas_coords: bool = True) -> pd.DataFrame:
+    """
+    Retorna uma cópia de df filtrada com colunas 'lat' e 'lon' prontas para o pydeck.
+    Tenta geocodificar cidades sem coords válidas e grava as coords encontradas na planilha.
+    """
+    df2 = df.copy()
+    # Garantir colunas de latitude/longitude existem
+    if "Latitude" not in df2.columns:
+        df2["Latitude"] = pd.NA
+    if "Longitude" not in df2.columns:
+        df2["Longitude"] = pd.NA
 
-
-# extrai coords recursivamente de geojson
-def _extract_coords_from_geojson_coords(coords, out):
-    if isinstance(coords[0], (float, int)):
-        out.append((coords[1], coords[0]))
-    else:
-        for c in coords:
-            _extract_coords_from_geojson_coords(c, out)
-
-
-def _centroid_and_bbox_from_feature(feature):
-    coords = []
-    geom = feature.get("geometry", {})
-    if not geom:
-        return None, None
-    _extract_coords_from_geojson_coords(geom.get("coordinates", []), coords)
-    if not coords:
-        return None, None
-    lats = [c[0] for c in coords]
-    lons = [c[1] for c in coords]
-    centroid = [sum(lats) / len(lats), sum(lons) / len(lons)]
-    bbox = [min(lats), min(lons), max(lats), max(lons)]
-    return centroid, bbox
-
-
-def _state_feature_by_sigla(geojson_estados, sigla):
-    for feat in geojson_estados.get("features", []):
-        props = feat.get("properties", {})
-        if props.get("sigla") == sigla or props.get("UF") == sigla or props.get("ESTADO") == sigla:
-            return feat
-    for feat in geojson_estados.get("features", []):
-        props = feat.get("properties", {})
-        nome = props.get("nome") or props.get("NOME") or ""
-        if sigla in nome:
-            return feat
-    return None
-
-
-def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
-    default_location = [-14.2350, -51.9253]
-    zoom_start = 5
-    if zoom_to_state and isinstance(zoom_to_state, dict):
-        center = zoom_to_state.get("center", default_location)
-        zoom_start = zoom_to_state.get("zoom", 6)
-        mapa = folium.Map(location=center, zoom_start=zoom_start, tiles="CartoDB positron")
-    else:
-        mapa = folium.Map(location=default_location, zoom_start=zoom_start, tiles="CartoDB positron")
-
-    for _, row in df.iterrows():
-        if filtro_distribuidores and row["Distribuidor"] not in filtro_distribuidores:
-            continue
-        cidade = row.get("Cidade", "")
-        estado = row.get("Estado", "")
-        geojson = None
-        try:
+    # Percorrer linhas sem coords válidas e tentar geocodificar
+    need_save = False
+    updated_rows = []
+    for idx, row in df2.iterrows():
+        lat = row["Latitude"]
+        lon = row["Longitude"]
+        if pd.isna(lat) or pd.isna(lon):
+            cidade = _safe_str(row.get("Cidade", ""))
+            estado = _safe_str(row.get("Estado", ""))
             if cidade and estado:
-                geojson = obter_geojson_cidade(cidade, estado)
-        except:
-            geojson = None
-
-        cor = cor_distribuidor(row.get("Distribuidor", ""))
-        if geojson and "features" in geojson:
-            try:
-                folium.GeoJson(
-                    geojson,
-                    style_function=lambda feature, cor=cor: {
-                        "fillColor": cor,
-                        "color": "#666666",
-                        "weight": 1.2,
-                        "fillOpacity": 0.55,
-                    },
-                    tooltip=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
-                ).add_to(mapa)
-            except:
-                pass
-        else:
-            try:
-                lat = row.get("Latitude", pd.NA)
-                lon = row.get("Longitude", pd.NA)
-                if pd.isna(lat) or pd.isna(lon):
-                    continue
-                if not (-35.0 <= lat <= 6.0 and -82.0 <= lon <= -30.0):
-                    continue
-                folium.CircleMarker(
-                    location=[float(lat), float(lon)],
-                    radius=8,
-                    color="#333333",
-                    fill=True,
-                    fill_color=cor,
-                    fill_opacity=0.8,
-                    popup=f"{row.get('Distribuidor','')} ({cidade} - {estado})",
-                ).add_to(mapa)
-            except:
-                continue
-
-    geo_estados = obter_geojson_estados()
-    if geo_estados:
+                lat_g, lon_g = geocode_with_cache(cidade, estado)
+                if lat_g is not None and lon_g is not None:
+                    df2.at[idx, "Latitude"] = lat_g
+                    df2.at[idx, "Longitude"] = lon_g
+                    need_save = True
+                    updated_rows.append(idx)
+        # else: deixa como está (assume que está limpo)
+    if need_save and salvar_novas_coords:
+        # salvar apenas se realmente encontrou novas coordenadas
         try:
-            folium.GeoJson(
-                geo_estados,
-                name="Divisas Estaduais",
-                style_function=lambda f: f.get("properties", {}).get("style", {
-                    "color": "#000000",
-                    "weight": 3,
-                    "fillOpacity": 0,
-                }),
-                tooltip=folium.GeoJsonTooltip(fields=["nome"], aliases=["Estado:"]),
-            ).add_to(mapa)
-        except:
-            pass
-
-    folium.LayerControl().add_to(mapa)
-    return mapa
+            salvar_dados(df2)
+        except Exception:
+            # não interrompe exibição do mapa por falha no save
+            st.warning("Aviso: ocorreu um erro ao salvar novas coordenadas na planilha.")
+    # construir colunas lat/lon para pydeck (float)
+    df2["lat"] = pd.to_numeric(df2["Latitude"], errors="coerce")
+    df2["lon"] = pd.to_numeric(df2["Longitude"], errors="coerce")
+    df2 = df2.dropna(subset=["lat", "lon"])
+    return df2
 
 
 # -----------------------------
-# LOGIN PERSISTENTE
+# Função que calcula view_state (center + zoom) para pydeck a partir de dados
+# pydeck usa latitude/longitude = center, zoom numeric
+# Vamos converter span em um zoom razoável (heurística)
 # -----------------------------
-USUARIOS_FILE = "usuarios.json"
+def calculate_view_state(df_points: pd.DataFrame, fallback_state: Optional[str] = None) -> Dict:
+    default_center = (-14.2350, -51.9253)
+    if df_points is None or df_points.empty:
+        if fallback_state and fallback_state in STATE_CENTROIDS:
+            c = STATE_CENTROIDS[fallback_state]["center"]
+            return {"latitude": c[0], "longitude": c[1], "zoom": STATE_CENTROIDS[fallback_state]["zoom"]}
+        return {"latitude": default_center[0], "longitude": default_center[1], "zoom": 4.8}
+
+    lats = df_points["lat"].astype(float)
+    lons = df_points["lon"].astype(float)
+    if lats.empty or lons.empty:
+        if fallback_state and fallback_state in STATE_CENTROIDS:
+            c = STATE_CENTROIDS[fallback_state]["center"]
+            return {"latitude": c[0], "longitude": c[1], "zoom": STATE_CENTROIDS[fallback_state]["zoom"]}
+        return {"latitude": default_center[0], "longitude": default_center[1], "zoom": 4.8}
+
+    center_lat = float(lats.mean())
+    center_lon = float(lons.mean())
+    lat_span = (lats.max() - lats.min()) if lats.max() != lats.min() else 0.01
+    lon_span = (lons.max() - lons.min()) if lons.max() != lons.min() else 0.01
+    span = max(lat_span, lon_span)
+
+    # heurística simples para zoom a partir do span (valores calibrados)
+    if span < 0.02:
+        zoom = 12.5
+    elif span < 0.2:
+        zoom = 10.5
+    elif span < 1.0:
+        zoom = 8.5
+    elif span < 3.0:
+        zoom = 6.8
+    else:
+        zoom = 5.0
+
+    return {"latitude": center_lat, "longitude": center_lon, "zoom": zoom}
 
 
+# -----------------------------
+# FUNÇÕES VALIDATION (telefone / email)
+# -----------------------------
+def validar_telefone(tel: str) -> bool:
+    padrao = r'^\(\d{2}\) \d{4,5}-\d{4}$'
+    return re.match(padrao, _safe_str(tel)) is not None
+
+
+def validar_email(email: str) -> bool:
+    padrao = r'^[\w\.-]+@[\w\.-]+\.\w+$'
+    return re.match(padrao, _safe_str(email)) is not None
+
+
+# -----------------------------
+# INIT USUARIOS (arquivo local)
+# -----------------------------
 def init_usuarios():
     try:
-        with open(USUARIOS_FILE, "r") as f:
+        with open(USUARIOS_FILE, "r", encoding="utf-8") as f:
             usuarios = json.load(f)
             if not isinstance(usuarios, dict):
-                raise ValueError("Formato inválido")
+                raise ValueError("Formato inválido de usuarios.json")
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        senha_hash = bcrypt.hashpw("admin123".encode(), bcrypt.gensalt()).decode()
+        senha_hash = bcrypt.hashpw("admin123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
         usuarios = {"admin": {"senha": senha_hash, "nivel": "editor"}}
-        with open(USUARIOS_FILE, "w") as f:
-            json.dump(usuarios, f, indent=4)
+        with open(USUARIOS_FILE, "w", encoding="utf-8") as f:
+            json.dump(usuarios, f, indent=4, ensure_ascii=False)
     return usuarios
 
 
@@ -427,16 +449,19 @@ logado = usuario_cookie != "" and nivel_cookie != ""
 usuario_atual = usuario_cookie if logado else None
 nivel_acesso = nivel_cookie if logado else None
 
+# -----------------------------
+# LOGIN
+# -----------------------------
 if not logado:
     st.title("🔐 Login de Acesso")
     usuario = st.text_input("Usuário")
     senha = st.text_input("Senha", type="password")
     if st.button("Entrar"):
-        if usuario in usuarios and bcrypt.checkpw(senha.encode(), usuarios[usuario]["senha"].encode()):
+        if usuario in usuarios and bcrypt.checkpw(senha.encode("utf-8"), usuarios[usuario]["senha"].encode("utf-8")):
             cookies["usuario"] = usuario
             cookies["nivel"] = usuarios[usuario]["nivel"]
             cookies.save()
-            st.rerun()
+            st.experimental_rerun()
         else:
             st.error("Usuário ou senha incorretos!")
     st.stop()
@@ -446,29 +471,25 @@ if st.sidebar.button("🚪 Sair"):
     cookies["usuario"] = ""
     cookies["nivel"] = ""
     cookies.save()
-    st.rerun()
+    st.experimental_rerun()
 
 # -----------------------------
-# CARREGAR DADOS (sessão)
+# Carregar dados inicial (sessão)
 # -----------------------------
 if "df" not in st.session_state:
     st.session_state.df = carregar_dados()
 if "cidade_busca" not in st.session_state:
     st.session_state.cidade_busca = ""
+if "estado_filtro" not in st.session_state:
+    st.session_state.estado_filtro = ""
+if "distribuidores_selecionados" not in st.session_state:
+    st.session_state.distribuidores_selecionados = []
 
+# -----------------------------
+# UI: menu lateral
+# -----------------------------
 menu = ["Cadastro", "Lista / Editar / Excluir", "Mapa"]
 choice = st.sidebar.radio("Navegação", menu)
-
-
-def validar_telefone(tel):
-    padrao = r'^\(\d{2}\) \d{4,5}-\d{4}$'
-    return re.match(padrao, tel)
-
-
-def validar_email(email):
-    padrao = r'^[\w\.-]+@[\w\.-]+\.\w+$'
-    return re.match(padrao, email)
-
 
 # =============================
 # CADASTRO
@@ -503,20 +524,18 @@ if choice == "Cadastro" and nivel_cookie == "editor":
                     dist_existente = st.session_state.df.loc[st.session_state.df["Cidade"] == c, "Distribuidor"].iloc[0]
                     cidades_ocupadas.append(f"{c} (atualmente atribuída a {dist_existente})")
             if cidades_ocupadas:
-                st.error(
-                    "As seguintes cidades já estão atribuídas a outros distribuidores:\n"
-                    + "\n".join(cidades_ocupadas)
-                )
+                st.error("As seguintes cidades já estão atribuídas a outros distribuidores:\n" + "\n".join(cidades_ocupadas))
             else:
                 novos = []
                 for c in cidades_sel:
-                    lat, lon = obter_coordenadas(c, estado_sel)
+                    lat, lon = geocode_with_cache(c, estado_sel)
+                    # converter e validar intervalo
                     try:
-                        if lat is None or lon is None or lat == "" or lon == "":
+                        if lat is None or lon is None:
                             lat_v, lon_v = pd.NA, pd.NA
                         else:
-                            lat_v = float(str(lat).replace(",", "."))
-                            lon_v = float(str(lon).replace(",", "."))
+                            lat_v = float(lat)
+                            lon_v = float(lon)
                             if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
                                 lat_v, lon_v = pd.NA, pd.NA
                     except:
@@ -533,8 +552,7 @@ if choice == "Cadastro" and nivel_cookie == "editor":
 # =============================
 elif choice == "Lista / Editar / Excluir":
     st.subheader("Distribuidores Cadastrados")
-    st.dataframe(st.session_state.df[["Distribuidor", "Contato", "Email", "Estado", "Cidade"]],
-                 use_container_width=True)
+    st.dataframe(st.session_state.df[["Distribuidor", "Contato", "Email", "Estado", "Cidade"]], use_container_width=True)
 
     if nivel_cookie == "editor":
         with st.expander("✏️ Editar"):
@@ -565,21 +583,18 @@ elif choice == "Lista / Editar / Excluir":
                                 dist_existente = outras_linhas.loc[outras_linhas["Cidade"] == cidade, "Distribuidor"].iloc[0]
                                 cidades_ocupadas.append(f"{cidade} (atualmente atribuída a {dist_existente})")
                         if cidades_ocupadas:
-                            st.error(
-                                "As seguintes cidades já estão atribuídas a outros distribuidores:\n"
-                                + "\n".join(cidades_ocupadas)
-                            )
+                            st.error("As seguintes cidades já estão atribuídas a outros distribuidores:\n" + "\n".join(cidades_ocupadas))
                         else:
                             st.session_state.df = st.session_state.df[st.session_state.df["Distribuidor"] != dist_edit]
                             novos = []
                             for cidade in cidades_novas:
-                                lat, lon = obter_coordenadas(cidade, estado_edit)
+                                lat, lon = geocode_with_cache(cidade, estado_edit)
                                 try:
-                                    if lat is None or lon is None or lat == "" or lon == "":
+                                    if lat is None or lon is None:
                                         lat_v, lon_v = pd.NA, pd.NA
                                     else:
-                                        lat_v = float(str(lat).replace(",", "."))
-                                        lon_v = float(str(lon).replace(",", "."))
+                                        lat_v = float(lat)
+                                        lon_v = float(lon)
                                         if not (-35.0 <= lat_v <= 6.0 and -82.0 <= lon_v <= -30.0):
                                             lat_v, lon_v = pd.NA, pd.NA
                                 except:
@@ -601,10 +616,10 @@ elif choice == "Lista / Editar / Excluir":
                     st.success(f"🗑️ '{dist_del}' removido!")
 
 # =============================
-# MAPA (filtros na sidebar, com busca de cidade mostrando mensagens/tabela)
+# MAPA (pydeck) - filtros na sidebar, busca por cidade mostrando mensagens/tabela
 # =============================
 elif choice == "Mapa":
-    st.subheader("🗺️ Mapa de Distribuidores")
+    st.subheader("🗺️ Mapa de Distribuidores (pydeck)")
 
     # Sidebar filtros combinados
     st.sidebar.markdown("### 🔎 Filtros do Mapa")
@@ -621,14 +636,17 @@ elif choice == "Mapa":
     estados = carregar_estados()
     siglas = [e["sigla"] for e in estados]
     estado_options = [""] + siglas
-    estado_index = 0 if st.session_state.estado_filtro == "" else estado_options.index(st.session_state.estado_filtro)
+    # calcular index seguro
+    try:
+        estado_index = 0 if st.session_state.estado_filtro == "" else estado_options.index(st.session_state.estado_filtro)
+    except ValueError:
+        estado_index = 0
     estado_filtro = st.sidebar.selectbox("Filtrar por Estado", estado_options, index=estado_index)
     st.session_state.estado_filtro = estado_filtro
 
     # Opções do multiselect Filtrar Distribuidores
     if estado_filtro:
-        distribuidores_opcoes = st.session_state.df.loc[st.session_state.df["Estado"] == estado_filtro, "Distribuidor"]\
-            .dropna().unique().tolist()
+        distribuidores_opcoes = st.session_state.df.loc[st.session_state.df["Estado"] == estado_filtro, "Distribuidor"].dropna().unique().tolist()
     else:
         distribuidores_opcoes = st.session_state.df["Distribuidor"].dropna().unique().tolist()
     distribuidores_opcoes = sorted(distribuidores_opcoes)
@@ -644,10 +662,10 @@ elif choice == "Mapa":
     todas_cidades = carregar_todas_cidades()
     if estado_filtro:
         todas_cidades = [c for c in todas_cidades if c.endswith(f" - {estado_filtro}")]
-    cidade_index = 0 if st.session_state.cidade_busca == "" else (
-        todas_cidades.index(st.session_state.cidade_busca) + 1
-        if st.session_state.cidade_busca in todas_cidades else 0
-    )
+    try:
+        cidade_index = 0 if st.session_state.cidade_busca == "" else (todas_cidades.index(st.session_state.cidade_busca) + 1 if st.session_state.cidade_busca in todas_cidades else 0)
+    except Exception:
+        cidade_index = 0
     cidade_selecionada_sidebar = st.sidebar.selectbox("Buscar Cidade", [""] + todas_cidades, index=cidade_index)
     if cidade_selecionada_sidebar:
         st.session_state.cidade_busca = cidade_selecionada_sidebar
@@ -679,121 +697,95 @@ elif choice == "Mapa":
         # Mensagem e tabela conforme comportamento desejado
         if df_cidade.empty:
             st.warning(f"❌ Nenhum distribuidor encontrado em **{st.session_state.cidade_busca}**.")
-            # Mesmo quando não há distribuidores, mostra mapa centrado no estado (se escolhido) ou no BR
+            # Mostrar mapa centrado no estado (se escolhido) ou no BR
             zoom_to_state = None
             if st.session_state.estado_filtro:
                 df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
-                lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
-                lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
-                lats = lats[(lats >= -35.0) & (lats <= 6.0)]
-                lons = lons[(lons >= -82.0) & (lons <= -30.0)]
-                if not lats.empty and not lons.empty:
-                    center_lat = float(lats.mean())
-                    center_lon = float(lons.mean())
-                    lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
-                    lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
-                    span = max(lat_span, lon_span)
-                    if span < 0.2:
-                        zoom = 11
-                    elif span < 1.0:
-                        zoom = 9
-                    elif span < 3.0:
-                        zoom = 8
-                    else:
-                        zoom = 6
-                    zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
-                else:
-                    if st.session_state.estado_filtro in STATE_CENTROIDS:
-                        zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
-                    else:
-                        zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
+                df_state_map = preparar_dataframe_para_mapa(df_state, salvar_novas_coords=False)
+                view = calculate_view_state(df_state_map, fallback_state=st.session_state.estado_filtro)
             else:
-                zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
+                view = calculate_view_state(pd.DataFrame(columns=["lat", "lon"]), fallback_state=None)
 
-            mapa = criar_mapa(pd.DataFrame(columns=COLUNAS), filtro_distribuidores=None, zoom_to_state=zoom_to_state)
-            st_folium(mapa, width=1200, height=700)
+            # construir pydeck vazio (somente center)
+            initial_view = pdk.ViewState(latitude=view["latitude"], longitude=view["longitude"], zoom=view["zoom"])
+            st.pydeck_chart(pdk.Deck(initial_view_state=initial_view, layers=[]), use_container_width=True)
         else:
             st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{st.session_state.cidade_busca}**:")
             # Mostrar tabela com Distribuidor, Contato, Email
-            st.dataframe(df_cidade[["Distribuidor", "Contato", "Email"]].reset_index(drop=True),
-                         use_container_width=True)
+            st.dataframe(df_cidade[["Distribuidor", "Contato", "Email"]].reset_index(drop=True), use_container_width=True)
 
             # Criar mapa apenas com df_cidade (aplica filtro de distribuidores caso tenham sido selecionados)
             df_cidade_map = df_cidade.copy()
             if st.session_state.distribuidores_selecionados:
-                df_cidade_map = df_cidade_map[df_cidade_map["Distribuidor"].isin(
-                    st.session_state.distribuidores_selecionados)]
+                df_cidade_map = df_cidade_map[df_cidade_map["Distribuidor"].isin(st.session_state.distribuidores_selecionados)]
 
-            # calcular zoom centrado em df_cidade_map (se tem coords válidas)
-            zoom_to_state = None
-            lats = pd.to_numeric(df_cidade_map["Latitude"], errors="coerce").dropna()
-            lons = pd.to_numeric(df_cidade_map["Longitude"], errors="coerce").dropna()
-            lats = lats[(lats >= -35.0) & (lats <= 6.0)]
-            lons = lons[(lons >= -82.0) & (lons <= -30.0)]
-            if not lats.empty and not lons.empty:
-                center_lat = float(lats.mean())
-                center_lon = float(lons.mean())
-                lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.02
-                lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.02
-                span = max(lat_span, lon_span)
-                if span < 0.02:
-                    zoom = 13
-                elif span < 0.2:
-                    zoom = 11
-                elif span < 1.0:
-                    zoom = 9
-                else:
-                    zoom = 8
-                zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
+            df_for_map = preparar_dataframe_para_mapa(df_cidade_map, salvar_novas_coords=True)
+            # montar camada de pontos
+            if df_for_map.empty:
+                st.warning("Nenhuma coordenada válida disponível para os distribuidores encontrados; o mapa será centrado no estado.")
+                view = calculate_view_state(pd.DataFrame(columns=["lat", "lon"]), fallback_state=st.session_state.estado_filtro)
+                initial_view = pdk.ViewState(latitude=view["latitude"], longitude=view["longitude"], zoom=view["zoom"])
+                st.pydeck_chart(pdk.Deck(initial_view_state=initial_view, layers=[]), use_container_width=True)
             else:
-                if st.session_state.estado_filtro and st.session_state.estado_filtro in STATE_CENTROIDS:
-                    zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
-                else:
-                    zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
+                df_for_map["color"] = df_for_map["Distribuidor"].apply(lambda n: int(cor_distribuidor_hex(n).lstrip("#"), 16) & 0xFFFFFF)
+                # pydeck espera array de ints RGB ou rgba; converter hex->(r,g,b)
+                def hex_to_rgb_int(h: str):
+                    h = h.lstrip("#")
+                    return [int(h[i:i+2], 16) for i in (0, 2, 4)]
+                df_for_map["rgb"] = df_for_map["Distribuidor"].apply(lambda n: hex_to_rgb_int(cor_distribuidor_hex(n)))
 
-            mapa = criar_mapa(
-                df_cidade_map,
-                filtro_distribuidores=(st.session_state.distribuidores_selecionados
-                                       if st.session_state.distribuidores_selecionados else None),
-                zoom_to_state=zoom_to_state
-            )
-            st_folium(mapa, width=1200, height=700)
+                layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    data=df_for_map,
+                    get_position=["lon", "lat"],
+                    get_fill_color="rgb",
+                    get_radius=8000,  # em metros; ajustar conforme zoom
+                    pickable=True,
+                    radius_min_pixels=4,
+                    radius_max_pixels=60,
+                    auto_highlight=True
+                )
+
+                view = calculate_view_state(df_for_map, fallback_state=st.session_state.estado_filtro)
+                tooltip = {
+                    "html": "<b>{Distribuidor}</b><br/>{Cidade} - {Estado}<br/>{Contato}<br/>{Email}",
+                    "style": {"backgroundColor": "white", "color": "black"}
+                }
+                deck = pdk.Deck(layers=[layer],
+                                initial_view_state=pdk.ViewState(latitude=view["latitude"],
+                                                                longitude=view["longitude"],
+                                                                zoom=view["zoom"],
+                                                                pitch=0),
+                                tooltip=tooltip)
+                st.pydeck_chart(deck, use_container_width=True)
+
     else:
         # Sem busca por cidade: aplicar filtros combinados e mostrar mapa geral
-        # df_filtro já aplicado por estado e por distribuidores selecionados acima
-        # Determinar zoom/centro de forma robusta (evitar Antártida)
-        zoom_to_state = None
-        if st.session_state.estado_filtro:
-            df_state = st.session_state.df[st.session_state.df["Estado"] == st.session_state.estado_filtro]
-            lats = pd.to_numeric(df_state["Latitude"], errors="coerce").dropna()
-            lons = pd.to_numeric(df_state["Longitude"], errors="coerce").dropna()
-            lats = lats[(lats >= -35.0) & (lats <= 6.0)]
-            lons = lons[(lons >= -82.0) & (lons <= -30.0)]
-            if not lats.empty and not lons.empty:
-                center_lat = float(lats.mean())
-                center_lon = float(lons.mean())
-                lat_span = lats.max() - lats.min() if lats.max() != lats.min() else 0.1
-                lon_span = lons.max() - lons.min() if lons.max() != lons.min() else 0.1
-                span = max(lat_span, lon_span)
-                if span < 0.2:
-                    zoom = 11
-                elif span < 1.0:
-                    zoom = 9
-                elif span < 3.0:
-                    zoom = 8
-                else:
-                    zoom = 6
-                zoom_to_state = {"center": [center_lat, center_lon], "zoom": zoom}
-            else:
-                if st.session_state.estado_filtro in STATE_CENTROIDS:
-                    zoom_to_state = STATE_CENTROIDS[st.session_state.estado_filtro]
-                else:
-                    zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
-
-        mapa = criar_mapa(
-            df_filtro,
-            filtro_distribuidores=(st.session_state.distribuidores_selecionados
-                                   if st.session_state.distribuidores_selecionados else None),
-            zoom_to_state=zoom_to_state
-        )
-        st_folium(mapa, width=1200, height=700)
+        df_for_map = preparar_dataframe_para_mapa(df_filtro, salvar_novas_coords=True)
+        if df_for_map.empty:
+            # fallback: centro do estado ou do Brasil
+            view = calculate_view_state(pd.DataFrame(columns=["lat", "lon"]), fallback_state=st.session_state.estado_filtro)
+            initial_view = pdk.ViewState(latitude=view["latitude"], longitude=view["longitude"], zoom=view["zoom"])
+            st.pydeck_chart(pdk.Deck(initial_view_state=initial_view, layers=[]), use_container_width=True)
+        else:
+            df_for_map["rgb"] = df_for_map["Distribuidor"].apply(lambda n: [int(c, 16) for c in (cor_distribuidor_hex(n).lstrip("#")[0:2], cor_distribuidor_hex(n).lstrip("#")[2:4], cor_distribuidor_hex(n).lstrip("#")[4:6])])
+            layer = pdk.Layer(
+                "ScatterplotLayer",
+                data=df_for_map,
+                get_position=["lon", "lat"],
+                get_fill_color="rgb",
+                get_radius=8000,
+                pickable=True,
+                radius_min_pixels=3,
+                radius_max_pixels=60,
+                auto_highlight=True
+            )
+            view = calculate_view_state(df_for_map, fallback_state=st.session_state.estado_filtro)
+            tooltip = {
+                "html": "<b>{Distribuidor}</b><br/>{Cidade} - {Estado}<br/>{Contato}<br/>{Email}",
+                "style": {"backgroundColor": "white", "color": "black"}
+            }
+            deck = pdk.Deck(layers=[layer],
+                            initial_view_state=pdk.ViewState(latitude=view["latitude"], longitude=view["longitude"], zoom=view["zoom"], pitch=0),
+                            tooltip=tooltip)
+            st.pydeck_chart(deck, use_container_width=True)
