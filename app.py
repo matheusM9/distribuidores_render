@@ -2,7 +2,6 @@
 # DISTRIBUIDORES APP - STREAMLIT (GOOGLE SHEETS)
 # Versão final: filtros sidebar, busca cidade com mensagem/tabela,
 # limpeza de filtros, zoom por estado robusto, sanitização lat/lon.
-# Inclui opção de renderização rápida (pydeck) ou detalhada (folium).
 # Base: https://docs.google.com/spreadsheets/d/1hxPKagOnMhBYI44G3vQHY_wQGv6iYTxHMd_0VLw2r-k (aba "Página1")
 # -------------------------------------------------------------
 
@@ -24,9 +23,6 @@ from streamlit_cookies_manager import EncryptedCookieManager
 import gspread
 from google.oauth2.service_account import Credentials
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
-
-# pydeck (renderização rápida)
-import pydeck as pdk
 
 st.set_page_config(page_title="Distribuidores", layout="wide")
 
@@ -327,8 +323,7 @@ def _state_feature_by_sigla(geojson_estados, sigla):
     return None
 
 
-# Criar mapa usando folium (detalhado)
-def criar_mapa_folium(df, filtro_distribuidores=None, zoom_to_state=None):
+def criar_mapa(df, filtro_distribuidores=None, zoom_to_state=None):
     default_location = [-14.2350, -51.9253]
     zoom_start = 5
     if zoom_to_state and isinstance(zoom_to_state, dict):
@@ -403,66 +398,6 @@ def criar_mapa_folium(df, filtro_distribuidores=None, zoom_to_state=None):
 
     folium.LayerControl().add_to(mapa)
     return mapa
-
-
-# Criar mapa usando pydeck (rápido, com pontos)
-def criar_mapa_pydeck(df, filtro_distribuidores=None, zoom_to_state=None, max_points=1000):
-    # filtrar e preparar pontos
-    df_pts = df.copy()
-    if filtro_distribuidores:
-        df_pts = df_pts[df_pts["Distribuidor"].isin(filtro_distribuidores)]
-
-    df_pts = df_pts.dropna(subset=["Latitude", "Longitude"]).copy()
-    if df_pts.empty:
-        # retornar None e o centro/zoom para fallback
-        return None
-
-    # limitar pontos para melhorar performance (amostragem por distribuidor se necessário)
-    if len(df_pts) > max_points:
-        df_pts = df_pts.sample(n=max_points, random_state=42)
-
-    df_pts["lat"] = df_pts["Latitude"].astype(float)
-    df_pts["lon"] = df_pts["Longitude"].astype(float)
-
-    center = [-14.2350, -51.9253]
-    zoom = 5
-    if zoom_to_state and isinstance(zoom_to_state, dict):
-        center = zoom_to_state.get("center", center)
-        zoom = zoom_to_state.get("zoom", zoom)
-    else:
-        # calcular centroide rápido
-        center_lat = float(df_pts["lat"].mean())
-        center_lon = float(df_pts["lon"].mean())
-        center = [center_lat, center_lon]
-
-    # camada de pontos
-    def get_icon_color(nome):
-        # converte cor_distribuidor para rgb
-        hexc = cor_distribuidor(nome).lstrip('#')
-        lv = tuple(int(hexc[i:i+2], 16) for i in (0, 2, 4))
-        return list(lv)
-
-    df_pts["color"] = df_pts["Distribuidor"].apply(lambda x: get_icon_color(x))
-
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=df_pts,
-        get_position="[lon, lat]",
-        get_fill_color="color",
-        get_radius=5000,  # metros; escala geral
-        radius_scale=0.15,
-        pickable=True,
-        auto_highlight=True,
-    )
-
-    tooltip = {"html": "<b>{Distribuidor}</b><br/>{Cidade} - {Estado}<br/>{Contato}", "style": {"backgroundColor": "steelblue", "color": "white"}}
-
-    deck = pdk.Deck(
-        initial_view_state=pdk.ViewState(latitude=center[0], longitude=center[1], zoom=zoom, pitch=0),
-        layers=[layer],
-        tooltip=tooltip,
-    )
-    return deck
 
 
 # -----------------------------
@@ -674,9 +609,6 @@ elif choice == "Mapa":
     # Sidebar filtros combinados
     st.sidebar.markdown("### 🔎 Filtros do Mapa")
 
-    # opção de renderer para performance
-    renderer = st.sidebar.selectbox("Renderização do Mapa (melhor performance)", ["pydeck (rápido)", "folium (detalhado)"])
-
     # garantir chaves de session_state
     if "estado_filtro" not in st.session_state:
         st.session_state.estado_filtro = ""
@@ -778,18 +710,8 @@ elif choice == "Mapa":
             else:
                 zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
 
-            # Renderizar conforme escolha do usuário
-            if renderer.startswith("pydeck"):
-                deck = criar_mapa_pydeck(pd.DataFrame(columns=COLUNAS), filtro_distribuidores=None, zoom_to_state=zoom_to_state)
-                if deck:
-                    st.pydeck_chart(deck)
-                else:
-                    # fallback para folium se pydeck não tiver pontos
-                    mapa = criar_mapa_folium(pd.DataFrame(columns=COLUNAS), filtro_distribuidores=None, zoom_to_state=zoom_to_state)
-                    st_folium(mapa, width=1200, height=700)
-            else:
-                mapa = criar_mapa_folium(pd.DataFrame(columns=COLUNAS), filtro_distribuidores=None, zoom_to_state=zoom_to_state)
-                st_folium(mapa, width=1200, height=700)
+            mapa = criar_mapa(pd.DataFrame(columns=COLUNAS), filtro_distribuidores=None, zoom_to_state=zoom_to_state)
+            st_folium(mapa, width=1200, height=700)
         else:
             st.success(f"✅ {len(df_cidade)} distribuidor(es) encontrado(s) em **{st.session_state.cidade_busca}**:")
             # Mostrar tabela com Distribuidor, Contato, Email
@@ -829,22 +751,13 @@ elif choice == "Mapa":
                 else:
                     zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
 
-            # Renderizar conforme escolha do usuário
-            if renderer.startswith("pydeck"):
-                deck = criar_mapa_pydeck(df_cidade_map, filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None), zoom_to_state=zoom_to_state)
-                if deck:
-                    st.pydeck_chart(deck)
-                else:
-                    mapa = criar_mapa_folium(df_cidade_map, filtro_distribuidores=(st.session_state.distribuidores_selecionados if st.session_state.distribuidores_selecionados else None), zoom_to_state=zoom_to_state)
-                    st_folium(mapa, width=1200, height=700)
-            else:
-                mapa = criar_mapa_folium(
-                    df_cidade_map,
-                    filtro_distribuidores=(st.session_state.distribuidores_selecionados
-                                           if st.session_state.distribuidores_selecionados else None),
-                    zoom_to_state=zoom_to_state
-                )
-                st_folium(mapa, width=1200, height=700)
+            mapa = criar_mapa(
+                df_cidade_map,
+                filtro_distribuidores=(st.session_state.distribuidores_selecionados
+                                       if st.session_state.distribuidores_selecionados else None),
+                zoom_to_state=zoom_to_state
+            )
+            st_folium(mapa, width=1200, height=700)
     else:
         # Sem busca por cidade: aplicar filtros combinados e mostrar mapa geral
         # df_filtro já aplicado por estado e por distribuidores selecionados acima
@@ -877,33 +790,10 @@ elif choice == "Mapa":
                 else:
                     zoom_to_state = {"center": [-14.2350, -51.9253], "zoom": 5}
 
-        # Renderizar conforme escolha do usuário
-        if renderer.startswith("pydeck"):
-            deck = criar_mapa_pydeck(
-                df_filtro,
-                filtro_distribuidores=(st.session_state.distribuidores_selecionados
-                                       if st.session_state.distribuidores_selecionados else None),
-                zoom_to_state=zoom_to_state,
-            )
-            if deck:
-                st.pydeck_chart(deck)
-            else:
-                mapa = criar_mapa_folium(
-                    df_filtro,
-                    filtro_distribuidores=(st.session_state.distribuidores_selecionados
-                                           if st.session_state.distribuidores_selecionados else None),
-                    zoom_to_state=zoom_to_state
-                )
-                st_folium(mapa, width=1200, height=700)
-        else:
-            mapa = criar_mapa_folium(
-                df_filtro,
-                filtro_distribuidores=(st.session_state.distribuidores_selecionados
-                                       if st.session_state.distribuidores_selecionados else None),
-                zoom_to_state=zoom_to_state
-            )
-            st_folium(mapa, width=1200, height=700)
-
-# -------------------------------------------------------------
-# FIM DO APP
-# -------------------------------------------------------------
+        mapa = criar_mapa(
+            df_filtro,
+            filtro_distribuidores=(st.session_state.distribuidores_selecionados
+                                   if st.session_state.distribuidores_selecionados else None),
+            zoom_to_state=zoom_to_state
+        )
+        st_folium(mapa, width=1200, height=700)
